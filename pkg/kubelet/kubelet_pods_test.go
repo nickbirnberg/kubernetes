@@ -50,6 +50,7 @@ import (
 	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/component-base/metrics/testutil"
+	resourcehelper "k8s.io/component-helpers/resource"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/cri-streaming/pkg/streaming/portforward"
 	"k8s.io/cri-streaming/pkg/streaming/remotecommand"
@@ -6844,6 +6845,110 @@ func TestConvertToAPIContainerStatusesDataRace(t *testing.T) {
 		go func() {
 			kl.convertToAPIContainerStatuses(tCtx, pod, criStatus, []v1.ContainerStatus{}, []v1.Container{}, nil, false, false, false)
 		}()
+	}
+}
+
+func TestConvertStatusToAPIStatusBeforeContainerCreation(t *testing.T) {
+	for _, kind := range []string{"application", "init", "sidecar"} {
+		for _, allocated := range []bool{false, true} {
+			for _, enabled := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/allocated=%t/enabled=%t", kind, allocated, enabled), func(t *testing.T) {
+					tCtx := ktesting.Init(t)
+					if !enabled {
+						// Use a pre-GA version to test disabling the now locked feature gate.
+						featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.34"))
+					}
+					featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, enabled)
+					testKubelet := newTestKubelet(t, false)
+					t.Cleanup(testKubelet.Cleanup)
+					kl := testKubelet.kubelet
+					requests := v1.ResourceList{v1.ResourceCPU: resource.MustParse("1"), v1.ResourceMemory: resource.MustParse("1Gi")}
+					container := v1.Container{Name: "container", Resources: v1.ResourceRequirements{Requests: requests, Limits: requests.DeepCopy()}}
+					pod := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "pod"}}
+					if kind == "application" {
+						pod.Spec.Containers = []v1.Container{container}
+					} else {
+						if kind == "sidecar" {
+							container.RestartPolicy = ptr.To(v1.ContainerRestartPolicyAlways)
+						}
+						pod.Spec.InitContainers = []v1.Container{container}
+					}
+					if allocated {
+						require.NoError(t, kl.allocationManager.SetAllocatedResources(tCtx.Logger(), pod))
+					}
+
+					status := kl.convertStatusToAPIStatus(tCtx, pod, &kubecontainer.PodStatus{}, v1.PodStatus{})
+					statuses := status.ContainerStatuses
+					waitingReason := ContainerCreating
+					if kind != "application" {
+						statuses = status.InitContainerStatuses
+						waitingReason = PodInitializing
+					}
+					require.Len(t, statuses, 1)
+					cs := statuses[0]
+					require.NotNil(t, cs.State.Waiting)
+					assert.Equal(t, waitingReason, cs.State.Waiting.Reason)
+					assert.Empty(t, cs.ContainerID)
+					if !allocated || !enabled {
+						assert.Nil(t, cs.Resources)
+						assert.Nil(t, cs.AllocatedResources)
+						return
+					}
+					require.Equal(t, &container.Resources, cs.Resources)
+					require.Equal(t, requests, cs.AllocatedResources)
+					cs.Resources.Requests[v1.ResourceCPU] = resource.MustParse("2")
+					cs.AllocatedResources[v1.ResourceCPU] = resource.MustParse("3")
+					allocation, found := kl.allocationManager.GetContainerResourceAllocation(pod.UID, container.Name)
+					require.True(t, found)
+					assert.Equal(t, requests, allocation.Requests)
+					assert.Equal(t, requests, container.Resources.Requests)
+				})
+			}
+		}
+	}
+}
+
+func TestConvertStatusToAPIStatusPendingContainerDownsize(t *testing.T) {
+	tCtx := ktesting.Init(t)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
+	testKubelet := newTestKubelet(t, false)
+	t.Cleanup(testKubelet.Cleanup)
+	kl := testKubelet.kubelet
+	resources := func(cpu string) v1.ResourceRequirements {
+		requests := v1.ResourceList{v1.ResourceCPU: resource.MustParse(cpu), v1.ResourceMemory: resource.MustParse("1Gi")}
+		return v1.ResourceRequirements{Requests: requests, Limits: requests.DeepCopy()}
+	}
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{UID: "pod"},
+		Spec: v1.PodSpec{
+			Containers:     []v1.Container{{Name: "app", Resources: resources("1")}},
+			InitContainers: []v1.Container{{Name: "sidecar", RestartPolicy: ptr.To(v1.ContainerRestartPolicyAlways), Resources: resources("15m")}},
+		},
+	}
+	require.NoError(t, kl.allocationManager.SetAllocatedResources(tCtx.Logger(), pod))
+	criStatus := &kubecontainer.PodStatus{ContainerStatuses: []*kubecontainer.Status{{Name: "sidecar", State: kubecontainer.ContainerStateRunning}}}
+
+	// An image pull can delay the main container after kubelet has reserved its CPU.
+	status := kl.convertStatusToAPIStatus(tCtx, pod, criStatus, v1.PodStatus{})
+	require.Len(t, status.ContainerStatuses, 1)
+	require.NotNil(t, status.ContainerStatuses[0].State.Waiting)
+	assert.Equal(t, PodInitializing, status.ContainerStatuses[0].State.Waiting.Reason)
+	pod.Status = *status
+	requests := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{UseStatusResources: true})
+	assert.Equal(t, int64(1015), requests.Cpu().MilliValue())
+
+	// A rejected downsize changes the API spec but leaves the checkpoint at 1 CPU.
+	resizedPod := pod.DeepCopy()
+	resizedPod.Spec.Containers[0].Resources = resources("100m")
+	allocatedPod, updated := kl.allocationManager.UpdatePodFromAllocation(resizedPod)
+	require.True(t, updated)
+	resizedPod.Status = *kl.convertStatusToAPIStatus(tCtx, allocatedPod, criStatus, pod.Status)
+	for _, infeasible := range []bool{false, true} {
+		if infeasible {
+			resizedPod.Status.Conditions = []v1.PodCondition{{Type: v1.PodResizePending, Status: v1.ConditionTrue, Reason: v1.PodReasonInfeasible}}
+		}
+		requests = resourcehelper.PodRequests(resizedPod, resourcehelper.PodResourcesOptions{UseStatusResources: true})
+		assert.Equal(t, int64(1015), requests.Cpu().MilliValue(), "infeasible=%t", infeasible)
 	}
 }
 
